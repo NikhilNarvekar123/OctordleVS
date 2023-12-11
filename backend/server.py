@@ -1,12 +1,7 @@
-from flask import Flask
-import requests
+from fastapi import FastAPI
 
-app = Flask(__name__)
+app = FastAPI()
 
-@app.route('/word', methods = ['GET'])
-def getRandomWord():
-    url = 'https://random-word-api.vercel.app/api?words=1&length=5'
-    word = requests.get(url)
-    return word.content
-
-app.run(port=3000)
+@app.get("/")
+async def root():
+    return {"message": "Hello World"}
