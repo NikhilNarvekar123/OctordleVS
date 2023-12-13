@@ -1,111 +1,128 @@
 from fastapi import FastAPI, HTTPException
 import httpx
-from session import UserSession
+from session import User, GameSession
 from typing import Optional
 from pydantic import BaseModel
 from collections import defaultdict
 from datetime import datetime
 
+
+'''
+TODO -> testing, edge cases, check if word is valid, improved error-handling
+'''
+
+
 app = FastAPI()
-# decide structure for user store -> uuid is key, then user should have list of sessions (each session is a wordle)
+
+
+MAX_NUM_GUESSES = 6
+
+
+# k: UID, v: User Obj
 user_store = defaultdict()
+# k: UID, v: {'total_games': X, 'wins': Y}
+user_stats_store = defaultdict()
 
-# TODO -> maybe move pydantic models into diff file so accessible throughout entire backned
 
-# TODO
+# base form of server req
+class BaseRequest(BaseModel):
+    uid: str
+
+# base form of a server rep
+class BaseResponse(BaseModel):
+    uid: str
+    # whether request was performed successfully
+    op_success: bool
+    error: Optional[str] = None
+
+# used for initial client-server connection
 class ConnectionRequest(BaseModel):
-    # uid could be stored in cookies and sent on initial request to reconnect
     uid: Optional[str] = None
-    # addl connection properties here
 
-# TODO
-class ConnectionResponse(BaseModel):
-    # return uid to user
-    uid: str
-    # whether user alr exists
-    new_session: bool
-
-# TODO - maybe could reuse another request obj (probably leave UID var in higher level object)
-class StartTimeRequest(BaseModel):
-    # uid
-    uid: str
-
-# TODO - maybe could reuse another request obj
-class StartTimeResponse(BaseModel):
-    # uid
-    uid: str
-    # whether start time was set or not
-    success: bool
-
-# TODO
-class GuessRequest(BaseModel):
-    # uid
-    uid: str
-    # answer
-    answer: str
-    # guess
+# used for word-guessing reqs
+class GuessRequest(BaseRequest):
     guess: str
 
-# TODO
-class GuessResponse(BaseModel):
-    # uid
-    uid: str
-    # whether guess was correct
-    correct: bool
+# responds to a given word-guess
+class GuessResponse(BaseResponse):
     # return what letters of guess were correct
     part_correct: Optional[str] = None
-    # if guess was successful then return total time taken to guess word
     time_taken: Optional[int] = None
-    # error (if err occurred)
-    error: Optional[bool] = None
+    is_last_guess: Optional[bool] = None
 
 
+# invoked when client loads in
+# TODO -> should successful connect to existing UID give success var as false?
+@app.post("/connect")
+async def connect(connection_req: ConnectionRequest):
+    if connection_req.uid in user_store:
+        return BaseResponse(uid=connection_req.uid, op_success=False)
+    user = User()
+    user_store[user.uid] = user
+    user_stats_store[user.uid] = {'total_games': 0, 'wins': 0}
+    return BaseResponse(uid=user.uid, op_success=True)
 
-# retrieves random 5 letter word from random-word-api
-@app.get('/word')
-async def get_random_word():
+# starts a game session for the given client
+@app.post("/start_game")
+async def start_game(start_game_req: BaseRequest):
+    if not start_game_req.uid in user_store:
+        return BaseResponse(uid=start_game_req.uid, op_success=False, error="Invalid UID")
+    
+    user = user_store[start_game_req.uid]
+    cur_sesh = user.make_new_session()
+
+    if user.uid in user_stats_store:
+        user_stats_store[user.uid]['total_games'] += 1
+    
+    # retrieve random word
     url = 'https://random-word-api.vercel.app/api?words=1&length=5'
+    word = None
     async with httpx.AsyncClient() as client:
         response = await client.get(url)
         if response.status_code == 200:
-            return response.content
+            word = response.content.decode('utf-8')[2:-2]
+            print(word)
         else:
-            raise HTTPException(status_code=response.status_code, detail="Failed to fetch random word")
-
-
-# assign user unique id and create a session
-@app.post("/connect/")
-async def connect(connection_req: ConnectionRequest):
-    if connection_req.uid in user_store:
-        return ConnectionResponse(uid=connection_req.uid, new_session=False)
-    userSesh = UserSession()
-    user_store[userSesh.get_uid()] = {}
-    return ConnectionResponse(uid=userSesh.get_uid(), new_session=True)
-
-# set puzzle start time
-# if want to keep answer in backend, would make it so that in this method
-# the server gets random word and stores it in user session obj to compare to in guess calls
-@app.post("/setstarttime")
-async def set_start_time(start_time_req: StartTimeRequest):
-    if start_time_req.uid in user_store:
-        current_time = datetime.now()
-        user_store[start_time_req.uid]['starttime'] = current_time
-        return StartTimeResponse(uid=start_time_req.uid, success=True)
-    else:
-        return StartTimeResponse(uid=start_time_req.uid, success=False)
+            error_msg = response.status_code + ": Failed to fetch random word"
+            return BaseResponse(uid=start_game_req.uid, op_success=False, error=error_msg)
     
-# check guess
-@app.post("/checkguess")
-async def set_start_time(guess_req: GuessRequest):
-    if guess_req.uid in user_store:
-        current_time = datetime.now()
-        if guess_req.answer == guess_req.guess:
-            user_store[guess_req.uid]['endtime'] = current_time
-            time_taken = int((current_time - user_store[guess_req.uid]['starttime']).total_seconds())
-            return GuessResponse(uid=guess_req.uid, correct=True, time_taken=time_taken)
-        else:
-            common_chars = [char1 if char1 == char2 else ' ' for char1, char2 in zip(guess_req.answer, guess_req.guess)]
-            res = ''.join(common_chars)
-            return GuessResponse(uid=guess_req.uid, correct=False, part_correct=res)
+    # update sesh
+    cur_sesh.word = word
+    cur_sesh.start_time = datetime.now()
+    return BaseResponse(uid=user.uid, op_success=True)
+
+# check guess on every user word submit
+@app.post("/check_guess")
+async def check_guess(guess_req: GuessRequest):
+    if not guess_req.uid in user_store:
+        return GuessResponse(uid=guess_req.uid, op_success=False, error="Invalid UID")
+
+    current_time = datetime.now()
+    cur_sesh = user_store[guess_req.uid].get_cur_session()
+
+    # prevent more than max guesses (redundant but in-case endpoint is called after session end)
+    if not cur_sesh.num_guesses < MAX_NUM_GUESSES:
+        return GuessResponse(uid=guess_req.uid, op_success=False, error="Guesses Exceeded")
+
+    res = cur_sesh.check_guess(guess_req.guess)
+
+    if res[0] == False:
+        # wrong guess
+        return GuessResponse(
+            uid=guess_req.uid,
+            op_success=False,
+            part_correct=res[1],
+            is_last_guess=(cur_sesh.num_guesses >= MAX_NUM_GUESSES)
+        )
     else:
-        return GuessResponse(uid=guess_req.uid, correct=False, error=True)
+        # right guess
+        cur_sesh.end_time = current_time
+        user_stats_store[guess_req.uid]['wins'] += 1
+
+        return GuessResponse(
+            uid=guess_req.uid,
+            op_success=True,
+            part_correct=res[1],
+            time_taken=cur_sesh.get_time_taken(),
+            is_last_guess=(cur_sesh.num_guesses >= MAX_NUM_GUESSES)
+        )
